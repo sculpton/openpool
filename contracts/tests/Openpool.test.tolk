@@ -1,5 +1,4 @@
 import "@acton/crypto"
-import "@acton/io"
 import "@acton/emulation/network"
 import "@acton/emulation/testing"
 import "@acton/testing/assert"
@@ -11,6 +10,7 @@ import "@contracts/errors"
 import "@contracts/messages"
 import "@contracts/storage"
 import "@wrappers/Openpool.gen"
+import "@contracts/common/c5"
 
 fun Expectation<T>.isType<U>(self): void {
     if (self.value is U) {
@@ -562,55 +562,559 @@ get fun `test remove jetton: success`() {
 
     testData.contractDataCompare();
 }
-/*
-get fun `test : fail - not owner`() {
-    val testData = setupTest();
 
-    testData.initialize(ton("5"));
+fun createSendTokensExternal(op: uint32 = SEND_TOKENS_EXTERNAL): SendTokensExternal {
+    val minter = randomAddress("minter");
+    val ownerWallet = randomAddress("owner_wallet");
 
-    val result = testData
-        .openpool
-        .send(
-            testData.notOwner.address,
-            123,
-            { value: ton("1") },
-        );
-
-    expect(result).toHaveFailedTx({
-        from: testData.notOwner.address,
-        to: testData.openpool.address,
-        exitCode: ERROR_NOT_FROM_OWNER,
-        body: {
+    return SendTokensExternal {
+        seqno: 111,
+        askInfo: AskToTransferInfo {
             queryId: 123,
-            value: ton("5"),
+            jettonMinter: minter,
+            jettonWallet: ownerWallet,
         }.toCell(),
+        jettonInfo: JettonMsg {
+            seqno: 1,
+            validUntil: blockchain.now() + 3600,
+            jettonAmount: 100,
+            comissionPercentMul: 5,
+            forwardNanoTonAmount: 1,
+            customPayload: null,
+            forwardPayload: null,
+        }.toCell(),
+        op: op,
+        extraActions: null,
+    };
+}
+
+fun rejectExternalMessage(testData: TestData, body: cell, error: int) {
+    val result = testData.openpool.sendAnyExternal(body);
+
+    expect(result).toBeNotAccepted();
+    expect(result).toHaveExternalVmExitCode(error);
+}
+
+fun runThroughAllOptions(fn: (uint32) -> ()) {
+    val opcodes: array<uint32> = [SEND_TOKENS_EXTERNAL, BURN_TOKENS_EXTERNAL];
+    var i = 0;
+
+    while (i < opcodes.size()) {
+        fn(opcodes.get(i));
+        i += 1;
+    }
+}
+
+get fun `test external: not init`() {
+    var testData = setupTest();
+    val data = PoolStorageNotInit {
+        index: testData.storage.index,
+        seqno: testData.storage.seqno,
+        collection: testData.storage.collection,
+    }.toCell();
+
+    val stateInit = StateInit {
+        fixedPrefixLength: null,
+        special: null,
+        code: testData.openpool.stateInit!.code,
+        data: data,
+        library: null,
+    };
+
+    val shardAccount = createShardAccount(testData.openpool.address, ton("1"), stateInit);
+
+    testing.setShardAccount(testData.openpool.address, shardAccount);
+
+    val state = testing.getAccountState(testData.openpool.address);
+
+    expect(state).toBeNotNull();
+    expect(state!.storage.state).hasEqualData(data);
+
+    runThroughAllOptions(fun(op) {
+        val msg = createSendTokensExternal(op);
+
+        val body = beginCell()
+            .storeSlice(msg.toCell().beginParse())
+            .storeSlice(crypto.sign(testData.keypair.privateKey, msg.toCell()))
+            .endCell();
+
+        rejectExternalMessage(testData, body, ERROR_NOT_INITIALIZED);
+
+        return ();
+    });
+}
+
+get fun `test external: insufficient funds`() {
+    var testData = setupTest();
+
+    testData.initialize(ton("0.05"));
+
+    testData.contractDataCompare();
+
+    runThroughAllOptions(fun(op) {
+        val msg = createSendTokensExternal(op);
+
+        val body = beginCell()
+            .storeSlice(msg.toCell().beginParse())
+            .storeSlice(crypto.sign(testData.keypair.privateKey, msg.toCell()))
+            .endCell();
+
+        rejectExternalMessage(testData, body, ERROR_INSUFFICIENT_FUNDS);
+
+        return ();
     });
 
     testData.contractDataCompare();
 }
 
-get fun `test : success`() {
-    val testData = setupTest();
+get fun `test external: invalid signature`() {
+    var testData = setupTest();
 
-    testData.initialize(ton("5"));
+    testData.initialize(ton("1.05"));
 
-    val result = testData
-        .openpool
-        .send(
-            testData.owner.address,
-            123,
-            { value: ton("0.05") },
-        );
+    testData.contractDataCompare();
 
-    expect(result).toHaveSuccessfulTx({
-        from: testData.owner.address,
-        to: testData.openpool.address,
-        body: {
-            queryId: 123,
-            value: ton("4"),
-        }.toCell(),
+    val keypair = crypto.generateKeyPair();
+
+    runThroughAllOptions(fun(op) {
+        val msg = createSendTokensExternal(op);
+
+        val body = beginCell()
+            .storeSlice(msg.toCell().beginParse())
+            .storeSlice(crypto.sign(keypair.privateKey, msg.toCell()))
+            .endCell();
+
+        rejectExternalMessage(testData, body, ERROR_INVALID_SIGNATURE);
+
+        return ();
     });
 
     testData.contractDataCompare();
 }
-*/
+
+get fun `test external: seqno not equal`() {
+    var testData = setupTest();
+
+    testData.initialize(ton("1.05"));
+
+    testData.contractDataCompare();
+
+    runThroughAllOptions(fun(op) {
+        var msg = createSendTokensExternal(op);
+
+        msg.seqno += 1;
+
+        val body = beginCell()
+            .storeSlice(msg.toCell().beginParse())
+            .storeSlice(crypto.sign(testData.keypair.privateKey, msg.toCell()))
+            .endCell();
+
+        rejectExternalMessage(testData, body, ERROR_INVALID_SEQNO);
+
+        return ();
+    });
+
+    testData.contractDataCompare();
+}
+
+get fun `test external: expired`() {
+    var testData = setupTest();
+
+    testData.initialize(ton("1.05"));
+
+    testData.contractDataCompare();
+
+    runThroughAllOptions(fun(op) {
+        var msg = createSendTokensExternal(op);
+
+        var jettonInfo = msg.jettonInfo.load();
+
+        jettonInfo.validUntil = blockchain.now() - 1;
+        msg.jettonInfo = jettonInfo.toCell();
+
+        val body = beginCell()
+            .storeSlice(msg.toCell().beginParse())
+            .storeSlice(crypto.sign(testData.keypair.privateKey, msg.toCell()))
+            .endCell();
+
+        rejectExternalMessage(testData, body, ERROR_EXPIRED);
+
+        return ();
+    });
+
+    testData.contractDataCompare();
+}
+
+get fun `test external: jetton empty`() {
+    var testData = setupTest();
+
+    testData.initialize(ton("1.05"));
+
+    testData.contractDataCompare();
+
+    runThroughAllOptions(fun(op) {
+        var msg = createSendTokensExternal(op);
+
+        val body = beginCell()
+            .storeSlice(msg.toCell().beginParse())
+            .storeSlice(crypto.sign(testData.keypair.privateKey, msg.toCell()))
+            .endCell();
+
+        rejectExternalMessage(testData, body, ERROR_JETTON_NOT_FOUND);
+
+        return ();
+    });
+
+    testData.contractDataCompare();
+}
+
+get fun `test external: not found jetton`() {
+    var testData = setupTest();
+
+    val minter = randomAddress("other-minter");
+    val ownerWallet = randomAddress("owner_wallet");
+
+    testData
+        .storage
+        .availableJettons
+        .set(
+            minter,
+            JettonInfo {
+                comissionPercentMul: 5,
+                minAmount: 100,
+                ownerWallet: ownerWallet,
+                forwardNanoTonLimit: 1,
+            }.toCell(),
+        );
+
+    testData.initialize(ton("1.05"));
+
+    testData.contractDataCompare();
+
+    runThroughAllOptions(fun(op) {
+        var msg = createSendTokensExternal(op);
+
+        val body = beginCell()
+            .storeSlice(msg.toCell().beginParse())
+            .storeSlice(crypto.sign(testData.keypair.privateKey, msg.toCell()))
+            .endCell();
+
+        rejectExternalMessage(testData, body, ERROR_JETTON_NOT_FOUND);
+
+        return ();
+    });
+
+    testData.contractDataCompare();
+}
+
+get fun `test external: not equal comission`() {
+    var testData = setupTest();
+
+    val minter = randomAddress("minter");
+    val ownerWallet = randomAddress("owner_wallet");
+
+    testData
+        .storage
+        .availableJettons
+        .set(
+            minter,
+            JettonInfo {
+                comissionPercentMul: 5,
+                minAmount: 100,
+                ownerWallet: ownerWallet,
+                forwardNanoTonLimit: 1,
+            }.toCell(),
+        );
+
+    testData.initialize(ton("1.05"));
+
+    testData.contractDataCompare();
+
+    runThroughAllOptions(fun(op) {
+        var msg = createSendTokensExternal(op);
+        var jettonInfo = msg.jettonInfo.load();
+
+        jettonInfo.comissionPercentMul = 4;
+        msg.jettonInfo = jettonInfo.toCell();
+
+        val body = beginCell()
+            .storeSlice(msg.toCell().beginParse())
+            .storeSlice(crypto.sign(testData.keypair.privateKey, msg.toCell()))
+            .endCell();
+
+        rejectExternalMessage(testData, body, ERROR_JETTON_NOT_EQUAL_COMMISION);
+
+        return ();
+    });
+
+    testData.contractDataCompare();
+}
+
+get fun `test external: unavailable message`() {
+    var testData = setupTest();
+
+    val minter = randomAddress("minter");
+    val ownerWallet = randomAddress("owner_wallet");
+
+    testData
+        .storage
+        .availableJettons
+        .set(
+            minter,
+            JettonInfo {
+                comissionPercentMul: 5,
+                minAmount: 100,
+                ownerWallet: ownerWallet,
+                forwardNanoTonLimit: 1,
+            }.toCell(),
+        );
+
+    testData.initialize(ton("1.05"));
+
+    testData.contractDataCompare();
+
+    runThroughAllOptions(fun(op) {
+        var msg = createSendTokensExternal(op);
+
+        msg.op = 11011;
+
+        val body = beginCell()
+            .storeSlice(msg.toCell().beginParse())
+            .storeSlice(crypto.sign(testData.keypair.privateKey, msg.toCell()))
+            .endCell();
+
+        rejectExternalMessage(testData, body, ERROR_INVALID_MESSAGE_OPERATION);
+
+        return ();
+    });
+
+    testData.contractDataCompare();
+}
+
+get fun `test external: jetton amount is less`() {
+    var testData = setupTest();
+
+    val minter = randomAddress("minter");
+    val ownerWallet = randomAddress("owner_wallet");
+
+    testData
+        .storage
+        .availableJettons
+        .set(
+            minter,
+            JettonInfo {
+                comissionPercentMul: 5,
+                minAmount: 100,
+                ownerWallet: ownerWallet,
+                forwardNanoTonLimit: 1,
+            }.toCell(),
+        );
+
+    testData.initialize(ton("1.05"));
+
+    testData.contractDataCompare();
+
+    runThroughAllOptions(fun(op) {
+        var msg = createSendTokensExternal(op);
+        var jettonInfo = msg.jettonInfo.load();
+
+        jettonInfo.jettonAmount = 99;
+
+        msg.jettonInfo = jettonInfo.toCell();
+
+        val body = beginCell()
+            .storeSlice(msg.toCell().beginParse())
+            .storeSlice(crypto.sign(testData.keypair.privateKey, msg.toCell()))
+            .endCell();
+
+        rejectExternalMessage(testData, body, ERROR_JETTON_LESS_THAN_MINIMUM);
+
+        return ();
+    });
+
+    testData.contractDataCompare();
+}
+
+get fun `test external: forward ton greater than maximum`() {
+    var testData = setupTest();
+
+    val minter = randomAddress("minter");
+    val ownerWallet = randomAddress("owner_wallet");
+
+    testData
+        .storage
+        .availableJettons
+        .set(
+            minter,
+            JettonInfo {
+                comissionPercentMul: 5,
+                minAmount: 100,
+                ownerWallet: ownerWallet,
+                forwardNanoTonLimit: 1,
+            }.toCell(),
+        );
+
+    testData.initialize(ton("1.05"));
+
+    testData.contractDataCompare();
+
+    var msg = createSendTokensExternal();
+    var jettonInfo = msg.jettonInfo.load();
+
+    jettonInfo.forwardNanoTonAmount = 2;
+
+    msg.jettonInfo = jettonInfo.toCell();
+
+    val body = beginCell()
+        .storeSlice(msg.toCell().beginParse())
+        .storeSlice(crypto.sign(testData.keypair.privateKey, msg.toCell()))
+        .endCell();
+
+    rejectExternalMessage(testData, body, ERROR_JETTON_NANO_TON_GREAT_THAN_MAXIMUM);
+
+    testData.contractDataCompare();
+}
+
+get fun `test external: transfer with actions success`() {
+    var testData = setupTest();
+
+    val minter = randomAddress("minter");
+    val ownerWallet = randomAddress("owner_wallet");
+
+    testData
+        .storage
+        .availableJettons
+        .set(
+            minter,
+            JettonInfo {
+                comissionPercentMul: 5,
+                minAmount: 100,
+                ownerWallet: ownerWallet,
+                forwardNanoTonLimit: 1,
+            }.toCell(),
+        );
+
+    testData.initialize(ton("1.05"));
+
+    testData.contractDataCompare();
+
+    var msg = createSendTokensExternal();
+
+    msg.extraActions = OutActionWithSendMessageOnly {
+        prev: createEmptyCell(),
+        sendMode: SEND_MODE_IGNORE_ERRORS,
+        outMsg: createMessage({
+            bounce: false,
+            value: ton("0.01"),
+            dest: testData.storage.owner,
+            body: beginCell().storeUint(0, 32).storeSlice("SOME TEXT MESSAGE".literalSlice()),
+        }).messageCell,
+    }.toCell() as OutActionsCell;
+
+    val body = beginCell()
+        .storeSlice(msg.toCell().beginParse())
+        .storeSlice(crypto.sign(testData.keypair.privateKey, msg.toCell()))
+        .endCell();
+
+    val result = testData.openpool.sendAnyExternal(body);
+
+    expect(result).toBeAccepted();
+
+    val txs = result.unwrap();
+
+    expect(txs).toHaveTx<AskToTransferByPool>({
+        from: testData.openpool.address,
+        to: ownerWallet,
+        body: AskToTransferByPool {
+            queryId: msg.askInfo.load().queryId,
+            sendExcessesTo: testData.openpool.address,
+            comissionWallet: ownerWallet,
+            poolInfo: PoolInfo {
+                index: testData.storage.index,
+                collection: testData.storage.collection,
+            }.toCell(),
+            jettonInfo: msg.jettonInfo,
+        }.toCell(),
+    });
+
+    expect(txs).toHaveTx({
+        from: testData.openpool.address,
+        to: testData.storage.owner,
+        body: beginCell().storeUint(0, 32).storeSlice("SOME TEXT MESSAGE".literalSlice()).endCell(),
+    });
+
+    testData.storage.seqno += 1;
+    testData.contractDataCompare();
+}
+
+get fun `test external: burn with actions success`() {
+    var testData = setupTest();
+
+    val minter = randomAddress("minter");
+    val ownerWallet = randomAddress("owner_wallet");
+
+    testData
+        .storage
+        .availableJettons
+        .set(
+            minter,
+            JettonInfo {
+                comissionPercentMul: 5,
+                minAmount: 100,
+                ownerWallet: ownerWallet,
+                forwardNanoTonLimit: 1,
+            }.toCell(),
+        );
+
+    testData.initialize(ton("1.05"));
+
+    testData.contractDataCompare();
+
+    var msg = createSendTokensExternal(BURN_TOKENS_EXTERNAL);
+
+    msg.extraActions = OutActionWithSendMessageOnly {
+        prev: createEmptyCell(),
+        sendMode: SEND_MODE_IGNORE_ERRORS,
+        outMsg: createMessage({
+            bounce: false,
+            value: ton("0.01"),
+            dest: testData.storage.owner,
+            body: beginCell().storeUint(0, 32).storeSlice("SOME TEXT MESSAGE".literalSlice()),
+        }).messageCell,
+    }.toCell() as OutActionsCell;
+
+    val body = beginCell()
+        .storeSlice(msg.toCell().beginParse())
+        .storeSlice(crypto.sign(testData.keypair.privateKey, msg.toCell()))
+        .endCell();
+
+    val result = testData.openpool.sendAnyExternal(body);
+
+    expect(result).toBeAccepted();
+
+    val txs = result.unwrap();
+
+    expect(txs).toHaveTx<AskToBurnByPool>({
+        from: testData.openpool.address,
+        to: ownerWallet,
+        body: AskToBurnByPool {
+            queryId: msg.askInfo.load().queryId,
+            sendExcessesTo: testData.openpool.address,
+            comissionWallet: ownerWallet,
+            poolInfo: PoolInfo {
+                index: testData.storage.index,
+                collection: testData.storage.collection,
+            }.toCell(),
+            jettonInfo: msg.jettonInfo,
+        }.toCell(),
+    });
+
+    expect(txs).toHaveTx({
+        from: testData.openpool.address,
+        to: testData.storage.owner,
+        body: beginCell().storeUint(0, 32).storeSlice("SOME TEXT MESSAGE".literalSlice()).endCell(),
+    });
+
+    testData.storage.seqno += 1;
+    testData.contractDataCompare();
+}

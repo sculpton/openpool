@@ -11,6 +11,7 @@ struct SendTokensExternal {
     askInfo: Cell<AskToTransferInfo>
     jettonInfo: Cell<JettonMsg>
     op: uint32
+    @abi.clientType(Cell<OutActionWithSendMessageOnly>?)
     extraActions: OutActionsCell?
 }
 

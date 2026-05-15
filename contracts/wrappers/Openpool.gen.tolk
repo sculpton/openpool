@@ -132,7 +132,7 @@ fun Openpool.sendAny(self, from: address, body: cell, config: SendParams = {}): 
 }
 
 /// Send an external-in message to the contract with a custom body cell
-fun Openpool.sendAnyExternal(self, body: cell): SendResultList? {
+fun Openpool.sendAnyExternal(self, body: cell): ExternalSendResult {
     val msg = net.createExternalMessage(self.address, body);
     return net.sendExternal(msg);
 }
